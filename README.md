@@ -64,11 +64,44 @@ python main.py
 | 파일 | 역할 |
 |------|------|
 | `main.py` | 전체 흐름 조율 (랜덤 선정 → 생성 → 발행) |
-| `config.py` | `.env` 로드 및 검증 |
-| `coupang_client.py` | 쿠팡 Wing API (HMAC 인증, 상품 목록/상세 조회) |
+| `product_uploader.py` | 쿠팡 상품 원클릭 등록 CLI |
+| `product_example.json` | 상품등록용 JSON 예제 |
+| `config.py` | `.env` 로드 및 검증 (판매자 배송/반품 프로필 포함) |
+| `coupang_client.py` | 쿠팡 Wing API (HMAC 인증, 상품 조회/등록/승인, 카테고리 추천) |
 | `ai_writer.py` | Gemini 소개글 생성 |
 | `threads_client.py` | Threads API (토큰 갱신, 2단계 발행) |
 | `.env.example` | 환경 변수 템플릿 |
+
+## 쿠팡 상품 원클릭 등록 (product_uploader.py)
+
+상품 정보 JSON을 작성해 쿠팡에 바로 등록합니다.
+
+```bash
+# 1. 예제 복사 후 실제 값 입력
+cp product_example.json my-product.json
+# → my-product.json 편집 (상품명, 가격, 이미지 URL, 고시정보 등)
+
+# 2. 카테고리 추천 (상품명으로 쿠팡 카테고리 코드 추천)
+python product_uploader.py my-product.json --recommend-category
+# → 추천 코드를 my-product.json의 displayCategoryCode에 입력
+
+# 3. 카테고리 필수 고시정보/구매옵션 확인
+python product_uploader.py my-product.json --category-meta
+# → 필수 notices(고시정보), attributes(구매옵션)를 JSON에 반영
+
+# 4. 미리보기 (API 호출 없이 페이로드 검증)
+python product_uploader.py my-product.json --dry-run
+
+# 5. 실제 등록 (확인 프롬프트 표시)
+python product_uploader.py my-product.json
+
+# 6. 등록 + 승인요청까지 한 번에
+python product_uploader.py my-product.json --yes --request-approval
+```
+
+> ⚠️ 쿠팡 API는 테스트 환경이 없습니다. 등록 호출 즉시 실제 판매 환경에 반영됩니다.
+> 반드시 `--dry-run`으로 먼저 확인하고, IP 화이트리스트에 등록된 PC에서 실행하세요.
+> 등록 후 카테고리는 변경할 수 없습니다.
 
 ## 참고
 
