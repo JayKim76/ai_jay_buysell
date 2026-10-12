@@ -9,6 +9,7 @@ import hashlib
 import hmac
 from datetime import datetime, timezone
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -20,6 +21,14 @@ CATEGORY_PREDICT_PATH = (
 CATEGORY_META_PATH = (
     "/v2/providers/seller_api/apis/api/v1/marketplace/meta/display-category-codes"
 )
+
+# 판매 가능으로 인정하는 statusName (쿠팡 API 응답 기준)
+ON_SALE_STATUS_NAMES = ("승인완료", "부분승인완료")
+
+# 상품페이지 soft-404 판별 문구
+DEAD_PAGE_MARKER = "상품을 찾을 수 없습니다"
+
+SEOUL_TZ = ZoneInfo("Asia/Seoul")
 
 
 class CoupangApiError(RuntimeError):
@@ -68,7 +77,8 @@ class CoupangClient:
             body = resp.json()
         except ValueError:
             raise CoupangApiError(f"쿠팡 API 응답 파싱 실패 (HTTP {resp.status_code})")
-        if resp.status_code != 200 or str(body.get("code")) != "200":
+        code_str = str(body.get("code")).upper()
+        if resp.status_code != 200 or code_str not in ("200", "SUCCESS"):
             raise CoupangApiError(
                 f"쿠팡 API 오류: code={body.get('code')}, message={body.get('message')}"
             )
@@ -77,12 +87,23 @@ class CoupangClient:
     def _get(self, path: str, params: dict | None = None) -> dict:
         return self._request("GET", path, params=params)
 
-    def list_products(self, max_per_page: int = 50) -> list[dict]:
-        """판매 중인 상품 전체 목록을 페이지네이션으로 조회합니다."""
+    def list_products(
+        self, max_per_page: int = 50, status: str = "APPROVED"
+    ) -> list[dict]:
+        """승인완료 상품 목록을 페이지네이션으로 조회합니다.
+
+        status: 쿠팡 API status 파라미터 (기본 "APPROVED"=승인완료).
+                IN_REVIEW(심사중)/SAVED(임시저장)/APPROVING(승인대기중)/
+                PARTIAL_APPROVED(부분승인완료)/DENIED(승인반려)/DELETED(상품삭제)
+        """
         products: list[dict] = []
         next_token = None
         while True:
-            params: dict = {"vendorId": self.vendor_id, "maxPerPage": max_per_page}
+            params: dict = {
+                "vendorId": self.vendor_id,
+                "maxPerPage": max_per_page,
+                "status": status,
+            }
             if next_token:
                 params["nextToken"] = next_token
             body = self._get(PRODUCTS_PATH, params)
@@ -96,6 +117,93 @@ class CoupangClient:
         """상품 상세 조회 (옵션/가격/이미지 포함)."""
         body = self._get(f"{PRODUCTS_PATH}/{seller_product_id}")
         return body.get("data") or {}
+
+    # ── 판매 상태 판별 ──────────────────────────────────
+
+    @staticmethod
+    def is_on_sale(detail: dict, now: "datetime | None" = None) -> "tuple[bool, str]":
+        """상품 상세 정보 기준으로 실제 판매중인지 판별합니다.
+
+        (판매가능 여부, 사유) 튜플을 반환합니다.
+        - statusName이 승인완료/부분승인완료가 아니면 False
+        - 현재 시각이 saleStartedAt ~ saleEndedAt 구간을 벗어나면 False
+        """
+        status_name = (detail.get("statusName") or "").strip()
+        if status_name not in ON_SALE_STATUS_NAMES:
+            return False, f"판매 불가 상태 (statusName={status_name or '없음'})"
+
+        if now is None:
+            now = datetime.now(SEOUL_TZ)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=SEOUL_TZ)
+
+        def _parse_kst(value: "str | None") -> "datetime | None":
+            # "yyyy-MM-dd'T'HH:mm:ss" (KST 기준)
+            if not value:
+                return None
+            try:
+                dt = datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=SEOUL_TZ)
+            return dt
+
+        started = _parse_kst(detail.get("saleStartedAt"))
+        ended = _parse_kst(detail.get("saleEndedAt"))
+        if started and now < started:
+            return False, f"판매 시작 전 (saleStartedAt={detail.get('saleStartedAt')})"
+        if ended and now > ended:
+            return False, f"판매 기간 종료 (saleEndedAt={detail.get('saleEndedAt')})"
+        return True, "판매중"
+
+    @staticmethod
+    def build_product_url(detail: dict) -> "str | None":
+        """구매자용 상품페이지 URL을 만듭니다.
+
+        상세 응답의 productId(구매자용 상품 ID)와 첫 옵션의 vendorItemId를 사용합니다.
+        productId가 없으면 None을 반환합니다.
+        """
+        product_id = detail.get("productId")
+        if not product_id:
+            return None
+        vendor_item_id = None
+        items = detail.get("items") or []
+        if items:
+            vendor_item_id = items[0].get("vendorItemId")
+        url = f"https://www.coupang.com/vp/products/{product_id}"
+        if vendor_item_id:
+            url += f"?vendorItemId={vendor_item_id}"
+        return url
+
+    @staticmethod
+    def check_product_page_alive(url: str, timeout: int = 10) -> "bool | None":
+        """상품페이지가 실제로 열리는지 확인합니다.
+
+        True: 정상 상품페이지로 판단
+        False: '상품을 찾을 수 없습니다' 페이지 확인 (판매중지/삭제 등)
+        None: 판단 불가 (네트워크 오류·접근 차단 등)
+        """
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ko-KR,ko;q=0.9",
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        except requests.RequestException:
+            return None
+        if resp.status_code in (404, 410):
+            return False
+        if resp.status_code == 403:
+            return None  # 접근 차단 — 판단 불가
+        body = resp.text or ""
+        if DEAD_PAGE_MARKER in body:
+            return False
+        return True
 
     # ── 상품 등록용 ──────────────────────────────────
 
