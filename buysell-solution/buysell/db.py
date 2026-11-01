@@ -122,6 +122,37 @@ CREATE TABLE IF NOT EXISTS inquiries (
     UNIQUE(channel, channel_inquiry_id)
 );
 
+CREATE TABLE IF NOT EXISTS sourcing_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    taobao_url TEXT NOT NULL,
+    platform TEXT,
+    item_id TEXT,
+    title_cn TEXT,
+    desc_text TEXT,
+    price_cny REAL,
+    cn_shipping_cny REAL DEFAULT 0,
+    exchange_rate REAL DEFAULT 200,
+    weight_kg REAL,
+    intl_rate_per_kg INTEGER DEFAULT 9000,
+    intl_shipping_krw INTEGER,
+    tax_rate REAL DEFAULT 0.10,
+    fee_rate REAL DEFAULT 0.11,
+    target_margin_rate REAL DEFAULT 0.20,
+    sale_price_krw INTEGER,
+    cost_breakdown TEXT,
+    margin_krw INTEGER,
+    margin_rate REAL,
+    generated_names TEXT,
+    search_tags TEXT,
+    name_method TEXT,
+    unsuitable_reasons TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    draft_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(taobao_url)
+);
+
 CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,

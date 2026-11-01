@@ -11,6 +11,9 @@
   python app.py morning              아침 경보 요약 출력 (+ reports/ 저장)
   python app.py demo                 데모 데이터 투입 (동작 확인용)
   python app.py clear-demo           데모 데이터 삭제
+  python app.py add-candidate --url 링크 --title 원제목 --price-cny 89 --weight-kg 1.2
+  python app.py candidates           소싱 후보·마진 목록
+  python app.py draft 후보ID          등록 초안 JSON 생성 (drafts/)
 """
 import argparse
 import os
@@ -39,6 +42,16 @@ def main():
     sub.add_parser("morning")
     sub.add_parser("demo")
     sub.add_parser("clear-demo")
+    p_add = sub.add_parser("add-candidate")
+    p_add.add_argument("--url", required=True)
+    p_add.add_argument("--title", default="")
+    p_add.add_argument("--desc", default="")
+    p_add.add_argument("--price-cny", type=float)
+    p_add.add_argument("--cn-shipping-cny", type=float, default=0)
+    p_add.add_argument("--weight-kg", type=float)
+    sub.add_parser("candidates")
+    p_draft = sub.add_parser("draft")
+    p_draft.add_argument("id", type=int)
     args = parser.parse_args()
 
     init_db()
@@ -76,6 +89,21 @@ def main():
     elif args.cmd == "clear-demo":
         sync.clear_demo()
         print("데모 데이터 삭제 완료")
+    elif args.cmd == "add-candidate":
+        from buysell.sourcing import add_candidate, list_candidates
+        cid = add_candidate(args.url, args.title, args.desc, price_cny=args.price_cny,
+                            cn_shipping_cny=args.cn_shipping_cny, weight_kg=args.weight_kg)
+        c = [x for x in list_candidates() if x["id"] == cid][0]
+        print(f"후보 #{cid} 등록: 상태={c['status']}, 판매가={c['sale_price_krw']}원, "
+              f"마진율={(c['margin_rate'] or 0) * 100:.1f}%")
+    elif args.cmd == "candidates":
+        from buysell.sourcing import list_candidates
+        for c in list_candidates():
+            print(f"#{c['id']} [{c['status']}] {c['taobao_url']} 판매가={c['sale_price_krw']} "
+                  f"마진율={(c['margin_rate'] or 0) * 100:.1f}% 사유={c['unsuitable_reasons']}")
+    elif args.cmd == "draft":
+        from buysell.sourcing import export_draft
+        print("등록 초안 생성:", export_draft(args.id))
 
 
 if __name__ == "__main__":

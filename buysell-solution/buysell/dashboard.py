@@ -7,9 +7,17 @@ import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import json
+
 from . import alerts as alert_engine
 from .db import STAGE_LABELS, STAGES, db
+from .sourcing import add_candidate, export_draft, list_candidates, update_candidate
 from .sync import add_inquiry, answer_inquiry, update_shipment, update_stage
+
+CANDIDATE_STATUS = {
+    "draft": "초안", "ready": "등록 가능", "check_needed": "확인 필요",
+    "low_margin": "마진 부족", "blocked": "등록 불가", "exported": "초안 생성됨",
+}
 
 CSS = """
 body{font-family:-apple-system,'Malgun Gothic','Apple SD Gothic Neo',sans-serif;margin:0;background:#f6f7f8;color:#1c1e21}
@@ -43,7 +51,7 @@ def _page(title, body):
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
 <style>{CSS}</style></head><body>
 <header><h1>바이셀 구매대행 통합 관리</h1>
-<nav><a href="/">홈·경보</a><a href="/orders">주문·배송</a><a href="/inquiries">문의</a>
+<nav><a href="/">홈·경보</a><a href="/sourcing">소싱·등록</a><a href="/orders">주문·배송</a><a href="/inquiries">문의</a>
 <a href="/morning">아침 요약</a></nav></header><main>{body}</main></body></html>"""
 
 
@@ -89,6 +97,48 @@ def _order_rows(orders, shipments):
 <input type="text" name="kr_tracking_no" placeholder="국내 운송장" value="{html.escape(s.get('kr_tracking_no') or '')}" size="13">
 <button>운송장 저장</button></form></td></tr>""")
     return ("<table><tr><th>주문</th><th>상품</th><th>단계</th><th>일정</th><th>발주·운송장</th></tr>"
+            + "".join(rows) + "</table>")
+
+
+def _candidate_rows(candidates):
+    if not candidates:
+        return '<p class="empty">소싱 후보가 없습니다. 타오바오 링크를 등록해 보세요.</p>'
+    rows = []
+    for c in candidates:
+        names = json.loads(c.get("generated_names") or "{}")
+        bd = json.loads(c.get("cost_breakdown") or "{}")
+        reasons = json.loads(c.get("unsuitable_reasons") or "[]")
+        tags = json.loads(c.get("search_tags") or "[]")
+        reason_html = ""
+        if reasons:
+            reason_html = "<br><span class='small' style='color:#c0392b'>" + "<br>".join(
+                html.escape(r) for r in reasons) + "</span>"
+        badge_cls = "critical" if c["status"] == "blocked" else (
+            "warning" if c["status"] in ("check_needed", "low_margin") else "stage")
+        draft_btn = ""
+        if c["status"] != "blocked":
+            draft_btn = (f'<form class="inline" method="post" action="/sourcing/draft">'
+                         f'<input type="hidden" name="id" value="{c["id"]}"><button>등록 초안 생성</button></form>')
+        draft_info = f"<br><span class='small'>초안: {html.escape(c['draft_path'])}</span>" if c.get("draft_path") else ""
+        rows.append(f"""<tr>
+<td><a href="{html.escape(c['taobao_url'])}" target="_blank">{html.escape(c['platform'] or '')} {html.escape(c['item_id'] or '')}</a>
+<br><span class="small">{html.escape(c['title_cn'] or '')}</span></td>
+<td><b>{html.escape(names.get('displayProductName_search') or '-')}</b>
+<br><span class="small">간결: {html.escape(names.get('displayProductName_short') or '')}</span>
+<br><span class="small">태그: {html.escape(' '.join(tags))} · 생성 {html.escape(c['name_method'] or '')}</span>{reason_html}</td>
+<td class="small">구매 {bd.get('goods_krw', 0):,}원<br>국제배송 {bd.get('intl_krw', 0):,}원 ({html.escape(str(bd.get('intl_source','')))})<br>
+관부가세 {bd.get('tax_krw', 0):,}원 · 수수료 {bd.get('fee_krw', 0):,}원<br>
+<b>판매가 {bd.get('sale_price_krw', 0):,}원</b> (역산 {bd.get('suggested_sale_price_krw', 0):,}원)<br>
+마진 {bd.get('margin_krw', 0):,}원 ({(bd.get('margin_rate') or 0)*100:.1f}% / 목표 {(bd.get('target_margin_rate') or 0)*100:.0f}%)</td>
+<td><span class="badge {badge_cls}">{CANDIDATE_STATUS.get(c['status'], c['status'])}</span><br><br>{draft_btn}{draft_info}
+<form method="post" action="/sourcing/update" style="margin-top:10px">
+<input type="hidden" name="id" value="{c['id']}">
+<input type="text" name="price_cny" placeholder="구매가 CNY" value="{c['price_cny'] if c['price_cny'] is not None else ''}" size="8">
+<input type="text" name="weight_kg" placeholder="무게 kg" value="{c['weight_kg'] if c['weight_kg'] is not None else ''}" size="6">
+<input type="text" name="intl_shipping_krw" placeholder="국제배송 직접입력" value="{c['intl_shipping_krw'] if c['intl_shipping_krw'] is not None else ''}" size="12"><br>
+<input type="text" name="sale_price_krw" placeholder="판매가 (비우면 자동 역산)" value="" size="16">
+<button class="gray">재계산</button></form></td></tr>""")
+    return ("<table><tr><th>타오바오</th><th>생성 상품명</th><th>마진 계산</th><th>상태·처리</th></tr>"
             + "".join(rows) + "</table>")
 
 
@@ -141,6 +191,18 @@ class Handler(BaseHTTPRequestHandler):
 <section><h2>주문·배송 (최근)</h2>{_order_rows(orders[:30], shipments)}
 <p class="small"><a href="/orders">전체 주문 보기</a></p></section>"""
             self._send(_page("홈·경보", body))
+        elif path == "/sourcing":
+            candidates = list_candidates(self.db_path)
+            form = """<form method="post" action="/sourcing/add" style="margin-bottom:18px">
+<input type="text" name="taobao_url" placeholder="타오바오 링크" size="42" required>
+<input type="text" name="title_cn" placeholder="원제목(중국어)" size="30">
+<input type="text" name="desc" placeholder="설명(재질·사이즈 등)" size="24"><br>
+<input type="text" name="price_cny" placeholder="구매가 CNY" size="10">
+<input type="text" name="cn_shipping_cny" placeholder="중국 배송비 CNY" size="12">
+<input type="text" name="weight_kg" placeholder="무게 kg" size="8">
+<button>후보 등록 + 상품명 생성</button>
+<p class="small">기본 가정: 환율 200원 · 국제배송 9,000원/kg · 관부가세 10% · 쿠팡 수수료 11% · 목표 마진 20% (후보별로 재계산 폼에서 조정 가능). GEMINI_API_KEY가 .env에 있으면 AI 생성, 없으면 규칙 생성으로 동작합니다.</p></form>"""
+            self._send(_page("소싱·등록", f"<section><h2>소싱·상품 등록 (2단계)</h2>{form}{_candidate_rows(candidates)}</section>"))
         elif path == "/orders":
             self._send(_page("주문·배송", f"<section><h2>주문·배송 관리</h2>{_order_rows(orders, shipments)}</section>"))
         elif path == "/inquiries":
@@ -174,7 +236,27 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8")).items()}
         try:
-            if path == "/alert/ack":
+            if path == "/sourcing/add":
+                def _num(key, cast=float):
+                    v = form.get(key, "")
+                    return cast(v) if v not in ("", None) else None
+                add_candidate(
+                    form["taobao_url"], form.get("title_cn", ""), form.get("desc", ""),
+                    price_cny=_num("price_cny"), cn_shipping_cny=_num("cn_shipping_cny") or 0,
+                    weight_kg=_num("weight_kg"), db_path=self.db_path)
+                self._redirect("/sourcing")
+            elif path == "/sourcing/update":
+                fields = {}
+                for key in ("price_cny", "weight_kg", "intl_shipping_krw", "sale_price_krw"):
+                    v = form.get(key, "")
+                    if v != "":
+                        fields[key] = float(v) if "." in v else int(v)
+                update_candidate(int(form["id"]), fields, self.db_path)
+                self._redirect("/sourcing")
+            elif path == "/sourcing/draft":
+                export_draft(int(form["id"]), self.db_path)
+                self._redirect("/sourcing")
+            elif path == "/alert/ack":
                 alert_engine.set_alert_status(int(form["id"]), "ack", self.db_path)
                 self._redirect("/")
             elif path == "/alert/resolve":
