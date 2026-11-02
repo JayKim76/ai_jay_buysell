@@ -52,6 +52,18 @@ def main():
     sub.add_parser("candidates")
     p_draft = sub.add_parser("draft")
     p_draft.add_argument("id", type=int)
+    p_settle = sub.add_parser("settle")
+    p_settle.add_argument("order_db_id", type=int)
+    p_settle.add_argument("--purchase-cny", type=float)
+    p_settle.add_argument("--cn-shipping-krw", type=int)
+    p_settle.add_argument("--intl-shipping-krw", type=int)
+    p_settle.add_argument("--customs-krw", type=int)
+    p_settle.add_argument("--other-krw", type=int)
+    p_pnl = sub.add_parser("pnl")
+    p_pnl.add_argument("--month", required=True, help="YYYY-MM")
+    p_ad = sub.add_parser("ad-distribute")
+    p_ad.add_argument("--month", required=True)
+    p_ad.add_argument("--total", type=int, required=True)
     args = parser.parse_args()
 
     init_db()
@@ -104,6 +116,28 @@ def main():
     elif args.cmd == "draft":
         from buysell.sourcing import export_draft
         print("등록 초안 생성:", export_draft(args.id))
+    elif args.cmd == "settle":
+        from buysell.settlement import get_settlement, set_settlement
+        fields = {k: v for k, v in {
+            "purchase_cny": args.purchase_cny, "cn_shipping_krw": args.cn_shipping_krw,
+            "intl_shipping_krw": args.intl_shipping_krw, "customs_krw": args.customs_krw,
+            "other_krw": args.other_krw}.items() if v is not None}
+        set_settlement(args.order_db_id, fields)
+        r = get_settlement(args.order_db_id)
+        print(f"정산 저장: 매출 {r['revenue']:,}원, 총비용 {r['total_cost']:,}원, "
+              f"실마진 {r['profit']:,}원 ({r['margin_rate'] * 100:.1f}%)")
+    elif args.cmd == "pnl":
+        from buysell.settlement import monthly_summary, product_summary
+        s = monthly_summary(args.month)
+        print(f"[{s['month']}] 정산 {s['orders_settled']}/{s['orders_total']}건 · "
+              f"매출 {s['revenue']:,}원 · 총비용 {s['total_cost']:,}원 · "
+              f"실이익 {s['profit']:,}원 · 마진율 {s['margin_rate'] * 100:.1f}%")
+        for p in product_summary(month=args.month):
+            print(f"  - {p['product_name']}: {p['orders']}건, 이익 {p['profit']:,}원, 마진율 {p['margin_rate'] * 100:.1f}%")
+    elif args.cmd == "ad-distribute":
+        from buysell.settlement import distribute_ad_cost
+        n = distribute_ad_cost(args.month, args.total)
+        print(f"광고비 {args.total:,}원을 {n}개 주문에 매출 비례 배분했어요.")
 
 
 if __name__ == "__main__":

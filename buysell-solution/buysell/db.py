@@ -153,6 +153,21 @@ CREATE TABLE IF NOT EXISTS sourcing_candidates (
     UNIQUE(taobao_url)
 );
 
+CREATE TABLE IF NOT EXISTS order_settlements (
+    order_id INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+    purchase_cny REAL,
+    exchange_rate REAL DEFAULT 200,
+    purchase_krw INTEGER DEFAULT 0,
+    cn_shipping_krw INTEGER DEFAULT 0,
+    intl_shipping_krw INTEGER DEFAULT 0,
+    customs_krw INTEGER DEFAULT 0,
+    fee_rate REAL DEFAULT 0.11,
+    fee_krw INTEGER,
+    ad_krw INTEGER DEFAULT 0,
+    other_krw INTEGER DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,

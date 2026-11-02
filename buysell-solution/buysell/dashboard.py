@@ -11,6 +11,9 @@ import json
 
 from . import alerts as alert_engine
 from .db import STAGE_LABELS, STAGES, db
+from .cs_templates import list_templates, render as render_template
+from .settlement import (available_months, distribute_ad_cost, get_settlement,
+                         monthly_summary, order_profits, product_summary, set_settlement)
 from .sourcing import add_candidate, export_draft, list_candidates, update_candidate
 from .sync import add_inquiry, answer_inquiry, update_shipment, update_stage
 
@@ -51,7 +54,7 @@ def _page(title, body):
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
 <style>{CSS}</style></head><body>
 <header><h1>바이셀 구매대행 통합 관리</h1>
-<nav><a href="/">홈·경보</a><a href="/sourcing">소싱·등록</a><a href="/orders">주문·배송</a><a href="/inquiries">문의</a>
+<nav><a href="/">홈·경보</a><a href="/sourcing">소싱·등록</a><a href="/orders">주문·배송</a><a href="/settlement">정산·손익</a><a href="/inquiries">문의</a>
 <a href="/morning">아침 요약</a></nav></header><main>{body}</main></body></html>"""
 
 
@@ -172,7 +175,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         alert_engine.evaluate(self.db_path)
         orders, shipments, inquiries = _fetch(self.db_path)
         alerts = alert_engine.open_alerts(self.db_path)
@@ -203,14 +208,70 @@ class Handler(BaseHTTPRequestHandler):
 <button>후보 등록 + 상품명 생성</button>
 <p class="small">기본 가정: 환율 200원 · 국제배송 9,000원/kg · 관부가세 10% · 쿠팡 수수료 11% · 목표 마진 20% (후보별로 재계산 폼에서 조정 가능). GEMINI_API_KEY가 .env에 있으면 AI 생성, 없으면 규칙 생성으로 동작합니다.</p></form>"""
             self._send(_page("소싱·등록", f"<section><h2>소싱·상품 등록 (2단계)</h2>{form}{_candidate_rows(candidates)}</section>"))
+        elif path == "/settlement":
+            months = available_months(self.db_path)
+            month = query.get("month") or (months[0] if months else "")
+            s = monthly_summary(month, self.db_path) if month else None
+            month_opts = "".join(
+                f'<option value="{m}" {"selected" if m == month else ""}>{m}</option>' for m in months)
+            cards = ""
+            if s:
+                cards = f"""
+<div class="cards">
+<div class="card"><div class="num">{s['profit']:,}원</div>실이익 ({month}, 정산 {s['orders_settled']}/{s['orders_total']}건)</div>
+<div class="card"><div class="num">{s['revenue']:,}원</div>매출 (정산 입력분)</div>
+<div class="card"><div class="num">{s['total_cost']:,}원</div>총비용</div>
+<div class="card"><div class="num">{s['margin_rate']*100:.1f}%</div>실마진율</div>
+</div>
+<p class="small">비용 구성: 구매 {s['purchase_krw']:,} · 중국배송 {s['cn_shipping_krw']:,} · 국제배송 {s['intl_shipping_krw']:,} · 관부가세 {s['customs_krw']:,} · 수수료 {s['fee_krw']:,} · 광고 {s['ad_krw']:,} · 기타 {s['other_krw']:,} (원) · 월 귀속은 배송완료일 기준, 없으면 주문일 기준 · 정산 미입력 주문은 손익 합계에서 제외</p>"""
+            rows = []
+            for r in order_profits(self.db_path, month or None):
+                o = r["order"]
+                st = "정산됨" if r["settled"] else "미입력"
+                profit_html = (f"<b>{r['profit']:,}원</b> ({r['margin_rate']*100:.1f}%)" if r["settled"] else "-")
+                rows.append(f"""<tr>
+<td><b>{html.escape(o['channel_order_id'])}</b><br><span class="small">{html.escape(o['product_name'] or '')}</span></td>
+<td>{r['revenue']:,}원</td>
+<td><form method="post" action="/settlement/save">
+<input type="hidden" name="id" value="{o['id']}"><input type="hidden" name="month" value="{month}">
+<input type="text" name="purchase_cny" placeholder="구매 CNY" size="7">
+<input type="text" name="cn_shipping_krw" placeholder="중국배송" size="7">
+<input type="text" name="intl_shipping_krw" placeholder="국제배송" size="7">
+<input type="text" name="customs_krw" placeholder="관부가세" size="7">
+<input type="text" name="other_krw" placeholder="기타" size="6">
+<button class="gray">비용 저장</button></form>
+<span class="small">구매 {r['purchase_krw']:,} · 배송 {r['cn_shipping_krw'] + r['intl_shipping_krw']:,} · 관부가세 {r['customs_krw']:,} · 수수료 {r['fee_krw']:,} · 광고 {r['ad_krw']:,}</span></td>
+<td>{profit_html}<br><span class="small">{st}</span></td></tr>""")
+            order_table = ("<table><tr><th>주문</th><th>매출</th><th>실비용 입력 (수수료는 비우면 판매가×11% 자동)</th><th>실마진</th></tr>"
+                           + "".join(rows) + "</table>") if rows else '<p class="empty">해당 월 주문이 없습니다.</p>'
+            prod_rows = []
+            for p in product_summary(self.db_path, month or None):
+                color = "#c0392b" if p["margin_rate"] < 0 else ("#b7791f" if p["margin_rate"] < 0.10 else "#1c1e21")
+                prod_rows.append(f"""<tr><td>{html.escape(p['product_name'])}</td><td>{p['orders']}건</td>
+<td>{p['revenue']:,}원</td><td>{p['profit']:,}원</td><td style="color:{color}"><b>{p['margin_rate']*100:.1f}%</b></td></tr>""")
+            prod_table = ("<table><tr><th>상품</th><th>주문</th><th>매출</th><th>이익</th><th>마진율 (낮은 순)</th></tr>"
+                          + "".join(prod_rows) + "</table>") if prod_rows else '<p class="empty">정산 입력된 주문이 없습니다.</p>'
+            ad_form = f"""<form method="post" action="/settlement/ad" style="margin-bottom:16px">
+<input type="hidden" name="month" value="{month}">
+<input type="text" name="total_ad_krw" placeholder="{month} 광고비 총액 (원)" size="20">
+<button>광고비 매출 비례 배분</button>
+<select name="month_select" onchange="location.href='/settlement?month='+this.value">{month_opts}</select>
+</form>"""
+            body = f"<section><h2>정산·손익 (3단계)</h2>{cards}{ad_form}{order_table}</section><section><h2>상품별 손익</h2>{prod_table}</section>"
+            self._send(_page("정산·손익", body))
         elif path == "/orders":
             self._send(_page("주문·배송", f"<section><h2>주문·배송 관리</h2>{_order_rows(orders, shipments)}</section>"))
         elif path == "/inquiries":
+            tpl_opts = "".join(f'<option value="{k}">{v}</option>' for k, v in list_templates().items())
             rows = []
             for q in inquiries:
                 act = ""
                 if q["status"] == "unanswered":
-                    act = (f'<form class="inline" method="post" action="/inquiry/answer">'
+                    act = (f'<form method="post" action="/inquiry/preview" style="margin-bottom:6px">'
+                           f'<input type="hidden" name="id" value="{q["id"]}">'
+                           f'<select name="template_key">{tpl_opts}</select> '
+                           f'<button class="gray">템플릿 미리보기</button></form>'
+                           f'<form class="inline" method="post" action="/inquiry/answer">'
                            f'<input type="hidden" name="id" value="{q["id"]}">'
                            f'<input type="text" name="template_used" placeholder="사용 템플릿" size="10"> '
                            f'<button>답변 완료</button></form>')
@@ -219,12 +280,20 @@ class Handler(BaseHTTPRequestHandler):
 <td>{'미답변' if q['status']=='unanswered' else '답변 완료'}</td>
 <td class="small">기한 {html.escape(q['due_at'][:16].replace('T',' ') if q['due_at'] else '')}</td><td>{act}</td></tr>""")
             table = "<table><tr><th>접수</th><th>상품</th><th>내용</th><th>상태</th><th>회신 기한</th><th></th></tr>" + "".join(rows) + "</table>" if rows else '<p class="empty">문의가 없습니다.</p>'
+            answered = [q for q in inquiries if q["status"] == "answered" and q["answered_at"] and q["received_at"]]
+            avg_txt = ""
+            if answered:
+                from .timeutil import hours_between
+                hs = [hours_between(q["received_at"], q["answered_at"]) for q in answered]
+                hs = [h for h in hs if h is not None]
+                if hs:
+                    avg_txt = f'<p class="small">답변 완료 {len(answered)}건 · 평균 답변 소요 {sum(hs)/len(hs):.1f}시간</p>'
             form = """<form method="post" action="/inquiry/add" style="margin-bottom:18px">
 <input type="text" name="product_name" placeholder="상품명" size="16">
 <input type="text" name="summary" placeholder="문의 내용 요약" size="34">
 <input type="datetime-local" name="received_at">
 <button>문의 등록</button> <span class="small">회신 기한은 접수 +72시간으로 자동 계산됩니다.</span></form>"""
-            self._send(_page("문의", f"<section><h2>CS 문의</h2>{form}{table}</section>"))
+            self._send(_page("문의", f"<section><h2>CS 문의</h2>{avg_txt}{form}{table}</section>"))
         elif path == "/morning":
             text = html.escape(alert_engine.morning_summary(self.db_path)).replace("\n", "<br>")
             self._send(_page("아침 요약", f"<section><h2>매일 아침 경보 요약</h2><p>{text}</p></section>"))
@@ -279,6 +348,34 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/inquiry/answer":
                 answer_inquiry(int(form["id"]), form.get("template_used", ""), self.db_path)
                 self._redirect("/inquiries")
+            elif path == "/inquiry/preview":
+                qid = int(form["id"])
+                with db(self.db_path) as conn:
+                    q = conn.execute("SELECT * FROM inquiries WHERE id=?", (qid,)).fetchone()
+                tpl_name = list_templates()[form["template_key"]]
+                text = render_template(form["template_key"],
+                                       product_name=(q["product_name"] if q else "") or "")
+                body = f"""<section><h2>템플릿 미리보기 — {html.escape(tpl_name)}</h2>
+<textarea rows="12" style="width:100%;font-size:14px;padding:10px" readonly>{html.escape(text)}</textarea>
+<p class="small">위 문구를 복사해 쿠팡 문의 답변에 붙여 넣으세요. 확인 후 아래 버튼을 누르면 이 문의가 답변 완료로 처리됩니다.</p>
+<form method="post" action="/inquiry/answer">
+<input type="hidden" name="id" value="{qid}">
+<input type="hidden" name="template_used" value="{html.escape(tpl_name)}">
+<button>이 템플릿으로 답변 완료 처리</button></form>
+<p><a href="/inquiries">문의 목록으로</a></p></section>"""
+                self._send(_page("템플릿 미리보기", body))
+            elif path == "/settlement/save":
+                fields = {}
+                for key in ("purchase_cny", "cn_shipping_krw", "intl_shipping_krw",
+                            "customs_krw", "other_krw"):
+                    v = form.get(key, "")
+                    if v != "":
+                        fields[key] = float(v) if "." in v else int(v)
+                set_settlement(int(form["id"]), fields, self.db_path)
+                self._redirect(f"/settlement?month={form.get('month', '')}")
+            elif path == "/settlement/ad":
+                distribute_ad_cost(form["month"], int(form.get("total_ad_krw") or 0), self.db_path)
+                self._redirect(f"/settlement?month={form.get('month', '')}")
             else:
                 self._send(_page("없음", "<section>페이지를 찾을 수 없습니다.</section>"), 404)
         except Exception as e:
